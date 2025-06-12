@@ -36,6 +36,7 @@
 #include <cmath>
 #include <string>
 #include <vector>
+#include <limits>
 
 #include "depthimage_to_laserscan/DepthImageToLaserScan_export.h"
 #include "depthimage_to_laserscan/depth_traits.hpp"
@@ -174,54 +175,50 @@ private:
       for (uint32_t u = 0; u < depth_msg->width; u++) {  // Loop over each pixel in row
         T depth = depth_row[u];
 
-        if (!depthimage_to_laserscan::DepthTraits<T>::valid(depth)) {  // Not NaN or Inf
-          continue;    // Skip invalid depths
-        }
-
-        double r;
+        double r = depth;  // Assign to pass through NaNs and Infs
         double th;
-        int index;
 
-        if (cam_model.cameraInfo().distortion_model == "rational_polynomial" &&
-          cam_model.cameraInfo().d.size() >= 8)
-        {
-          // Get the camera model coefficients
-          const auto & k = cam_model.cameraInfo().k;
+        if (depthimage_to_laserscan::DepthTraits<T>::valid(depth)) {  // Not NaN or Inf
           const double z = depthimage_to_laserscan::DepthTraits<T>::toMeters(depth);
 
-          // Create the camera matrix
-          static const cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) <<
-            k[0], k[1], k[2],
-            k[3], k[4], k[5],
-            k[6], k[7], k[8]);
+          // Check distortion model and apply undistortion if necessary
+          if (cam_model.cameraInfo().distortion_model == "rational_polynomial" &&
+            cam_model.cameraInfo().d.size() >= 8)
+          {
+            const auto & k = cam_model.cameraInfo().k;
+            static const cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) <<
+              k[0], k[1], k[2],
+              k[3], k[4], k[5],
+              k[6], k[7], k[8]);
+            std::vector<cv::Point2d> distorted_points{cv::Point2d(u, v)};
+            std::vector<cv::Point2d> undistorted_points;
+            cv::undistortPoints(
+              distorted_points, undistorted_points,
+              cameraMatrix, cam_model.distortionCoeffs());
 
-          // Undistort point
-          std::vector<cv::Point2d> distorted_points{cv::Point2d(u, v)};
-          std::vector<cv::Point2d> undistorted_points;
-          cv::undistortPoints(
-            distorted_points, undistorted_points,
-            cameraMatrix, cam_model.distortionCoeffs());
-
-          const double x = undistorted_points[0].x * z;
-          th = -std::atan2(x, z);
-          r = z;
+            const double x = undistorted_points[0].x * z;
+            th = -std::atan2(x, z);  // Overwrite default th value
+            r = z;
+          } else {
+            // Original common case
+            // Atan2(x, z), but depth divides out
+            th = -std::atan2(static_cast<double>(u - center_x) * constant_x, unit_scaling);
+            // Calculate in XYZ
+            const double x = (u - center_x) * depth * constant_x;
+            r = std::sqrt(x * x + z * z);
+          }
         } else {
-          // Original common case
-          // Calculate in XYZ
-          const double x = (u - center_x) * depth * constant_x;
-          const double z = depthimage_to_laserscan::DepthTraits<T>::toMeters(depth);
-
-          // Atan2(x, z), but depth divides out
+          // Compute angle, even if depth is NaN or Inf
           th = -std::atan2(static_cast<double>(u - center_x) * constant_x, unit_scaling);
-
-          // Calculate actual distance
-          r = std::sqrt(std::pow(x, 2.0) + std::pow(z, 2.0));
         }
 
-        index = static_cast<int>((th - scan_msg->angle_min) / scan_msg->angle_increment);
-        // Determine if this point should be used.
-        if (use_point(r, scan_msg->ranges[index], scan_msg->range_min, scan_msg->range_max)) {
-          scan_msg->ranges[index] = r;
+        int index = static_cast<int>((th - scan_msg->angle_min) / scan_msg->angle_increment);
+        // Check if index is within bounds of the scan_msg
+        if (index >= 0 && index < static_cast<int>(scan_msg->ranges.size())) {
+          // Determine if this point should be used.
+          if (use_point(r, scan_msg->ranges[index], scan_msg->range_min, scan_msg->range_max)) {
+            scan_msg->ranges[index] = r;
+          }
         }
       }
     }
