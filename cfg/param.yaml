@@ -1,8 +1,8 @@
 depthimage_to_laserscan:
   ros__parameters:
     scan_time: 0.033
-    range_min: 0.45
-    range_max: 10.0
-    scan_height: 1
-    scan_offset: 0.5
-    output_frame: "camera_depth_frame"
+    range_min: 0.3
+    range_max: 5.0
+    scan_height: 200        # image height x width = 512 x 512
+    scan_offset: 0.6953125  # [512 / 2 (center) + 100 (offset)] / 512
+    output_frame: "cam1_adtf31xx"
