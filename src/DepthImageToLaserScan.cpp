@@ -51,7 +51,8 @@ DepthImageToLaserScan::DepthImageToLaserScan(
   float scan_time, float range_min, float range_max,
   int scan_height, float scan_offset, const std::string & frame_id)
 : scan_time_(scan_time), range_min_(range_min), range_max_(range_max), scan_height_(scan_height),
-  scan_offset_(scan_offset), output_frame_id_(frame_id)
+  scan_offset_(scan_offset), output_frame_id_(frame_id), lookup_tables_initialized_(false),
+  cached_image_width_(0), cached_center_x_(0.0), cached_constant_x_(0.0)
 {
 }
 

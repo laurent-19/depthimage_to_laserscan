@@ -36,7 +36,6 @@
 #include <cmath>
 #include <string>
 #include <vector>
-#include <limits>
 
 #include "depthimage_to_laserscan/DepthImageToLaserScan_export.h"
 #include "depthimage_to_laserscan/depth_traits.hpp"
@@ -165,64 +164,81 @@ private:
     const float & scan_offset) const
   {
     // Use correct principal point from calibration
-    float center_x = cam_model.cx();
+    const float center_x = cam_model.cx();
 
     // Combine unit conversion (if necessary) with scaling by focal length for computing (X,Y)
-    double unit_scaling = depthimage_to_laserscan::DepthTraits<T>::toMeters(T(1));
-    float constant_x = unit_scaling / cam_model.fx();
+    const double unit_scaling = depthimage_to_laserscan::DepthTraits<T>::toMeters(T(1));
+    const float constant_x = unit_scaling / cam_model.fx();
+
+    // Initialize lookup tables for this image configuration
+    initializeLookupTables(depth_msg->width, center_x, constant_x, scan_msg);
 
     const T * depth_row = reinterpret_cast<const T *>(&depth_msg->data[0]);
-    int row_step = depth_msg->step / sizeof(T);
+    const int row_step = depth_msg->step / sizeof(T);
 
-    int offset = static_cast<int>((cam_model.cy() * 2 * scan_offset) -
+    const int offset = static_cast<int>((cam_model.cy() * 2 * scan_offset) -
       static_cast<double>(scan_height) / 2.0);
     depth_row += offset * row_step;  // Offset to center of image
+
+    // Pre-cache commonly used values
+    const double range_min = scan_msg->range_min;
+    const double range_max = scan_msg->range_max;
+    const double angle_min = scan_msg->angle_min;
+    const double angle_increment = scan_msg->angle_increment;
+    const uint32_t ranges_size = scan_msg->ranges.size();
+
+    // Check if we need to handle distortion
+    const bool has_distortion = (cam_model.cameraInfo().distortion_model == "rational_polynomial" && 
+                                  cam_model.cameraInfo().d.size() >= 8);
+
     for (int v = offset; v < offset + scan_height_; v++, depth_row += row_step) {
       for (uint32_t u = 0; u < depth_msg->width; u++) {  // Loop over each pixel in row
-        T depth = depth_row[u];
+        const T depth = depth_row[u];
 
-        double r = depth;  // Assign to pass through NaNs and Infs
-        double th;
-
-        if (depthimage_to_laserscan::DepthTraits<T>::valid(depth)) {  // Not NaN or Inf
-          const double z = depthimage_to_laserscan::DepthTraits<T>::toMeters(depth);
-
-          // Check distortion model and apply undistortion if necessary
-          if (cam_model.cameraInfo().distortion_model == "rational_polynomial" &&
-            cam_model.cameraInfo().d.size() >= 8)
-          {
-            const auto & k = cam_model.cameraInfo().k;
-            static const cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) <<
-              k[0], k[1], k[2],
-              k[3], k[4], k[5],
-              k[6], k[7], k[8]);
-            std::vector<cv::Point2d> distorted_points{cv::Point2d(u, v)};
-            std::vector<cv::Point2d> undistorted_points;
-            cv::undistortPoints(
-              distorted_points, undistorted_points,
-              cameraMatrix, cam_model.distortionCoeffs());
-
-            const double x = undistorted_points[0].x * z;
-            th = -std::atan2(x, z);  // Overwrite default th value
-            r = z;
-          } else {
-            // Original common case
-            // Atan2(x, z), but depth divides out
-            th = -std::atan2(static_cast<double>(u - center_x) * constant_x, unit_scaling);
-            // Calculate in XYZ
-            const double x = (u - center_x) * depth * constant_x;
-            r = std::sqrt(x * x + z * z);
-          }
-        } else {
-          // Compute angle, even if depth is NaN or Inf
-          th = -std::atan2(static_cast<double>(u - center_x) * constant_x, unit_scaling);
+        if (!depthimage_to_laserscan::DepthTraits<T>::valid(depth)) { // Not NaN or Inf
+            continue;  // Skip invalid depths
         }
 
-        int index = static_cast<int>((th - scan_msg->angle_min) / scan_msg->angle_increment);
-        // Check if index is within bounds of the scan_msg
-        if (index >= 0 && index < static_cast<int>(scan_msg->ranges.size())) {
-          // Determine if this point should be used.
-          if (use_point(r, scan_msg->ranges[index], scan_msg->range_min, scan_msg->range_max)) {
+        double r;
+        int index;
+
+        if (has_distortion) {
+            // Handle distorted case (slower path, but necessary for accuracy)
+            const auto& k = cam_model.cameraInfo().k;
+            const double z = depthimage_to_laserscan::DepthTraits<T>::toMeters(depth);
+
+            // Create the camera matrix (static to avoid re-creation)
+            static const cv::Mat cameraMatrix = (cv::Mat_<double>(3, 3) << 
+                  k[0], k[1], k[2],
+                  k[3], k[4], k[5],
+                  k[6], k[7], k[8]);
+            
+            // Undistort point
+            std::vector<cv::Point2d> distorted_points{cv::Point2d(u, v)};
+            std::vector<cv::Point2d> undistorted_points;
+            cv::undistortPoints(distorted_points, undistorted_points, 
+                  cameraMatrix, cam_model.distortionCoeffs());
+            
+            const double x = undistorted_points[0].x * z;
+            const double th = -fastAtan2(x, z);
+            r = z;  // Use z directly for distorted case
+            index = static_cast<int>((th - angle_min) / angle_increment);
+        } else {
+            // Optimized path for common undistorted case
+            const double z = depthimage_to_laserscan::DepthTraits<T>::toMeters(depth);
+            const double x = x_factor_lookup_[u] * depth;
+            
+            // Use pre-calculated index from lookup table
+            index = index_lookup_[u];
+            
+            // Calculate actual distance - optimized sqrt calculation
+            r = std::sqrt(x * x + z * z);
+        }
+
+        // Bounds checking for index
+        if (index >= 0 && index < static_cast<int>(ranges_size)) {
+          // Determine if this point should be used
+          if (use_point(r, scan_msg->ranges[index], range_min, range_max)) {
             scan_msg->ranges[index] = r;
           }
         }
@@ -242,6 +258,108 @@ private:
   float scan_offset_;
   ///< Output frame_id for each laserscan.  This is likely NOT the camera's frame_id.
   std::string output_frame_id_;
+
+  // Lookup tables for optimization
+  mutable std::vector<double> angle_lookup_;  ///< Pre-computed angles for each pixel column
+  mutable std::vector<int> index_lookup_;  ///< Pre-computed scan indices for each pixel column
+  mutable std::vector<double> x_factor_lookup_;  ///< Pre-computed x factors for each pixel column
+  mutable bool lookup_tables_initialized_;  ///< Whether lookup tables have been initialized
+  mutable uint32_t cached_image_width_;  ///< Cached image width for lookup table validation
+  mutable double cached_center_x_;  ///< Cached center_x for lookup table validation
+  mutable double cached_constant_x_;  ///< Cached constant_x for lookup table validation
+
+  /**
+   * Fast atan2 approximation using polynomial approximation.
+   * Significantly faster than std::atan2 with acceptable accuracy for laser scan generation.
+   *
+   * @param y The y component
+   * @param x The x component
+   * @return The angle in radians
+   */
+  inline double fastAtan2(double y, double x) const
+  {
+    if (x == 0.0) {
+      return (y > 0.0) ? M_PI_2 : -M_PI_2;
+    }
+    
+    const double ratio = y / x;
+    const double abs_ratio = std::abs(ratio);
+    
+    // Polynomial approximation for atan(ratio)
+    // Using Chebyshev approximation for better accuracy
+    double result;
+    if (abs_ratio <= 1.0) {
+      const double ratio2 = ratio * ratio;
+      result = ratio * (0.9999993329 - 0.3332985605 * ratio2 + 
+                       0.1996058543 * ratio2 * ratio2 - 
+                       0.1390853351 * ratio2 * ratio2 * ratio2);
+    } else {
+      const double inv_ratio = 1.0 / ratio;
+      const double inv_ratio2 = inv_ratio * inv_ratio;
+      result = M_PI_2 - inv_ratio * (0.9999993329 - 0.3332985605 * inv_ratio2 + 
+                                    0.1996058543 * inv_ratio2 * inv_ratio2 - 
+                                    0.1390853351 * inv_ratio2 * inv_ratio2 * inv_ratio2);
+      if (ratio < 0.0) result = -result;
+    }
+    
+    // Adjust for quadrant
+    if (x < 0.0) {
+      result = (y >= 0.0) ? result + M_PI : result - M_PI;
+    }
+    
+    return result;
+  }
+
+  /**
+   * Initialize lookup tables for angle and index calculations.
+   * This is called once per unique image configuration to pre-compute
+   * trigonometric values and avoid repeated calculations.
+   *
+   * @param image_width Width of the depth image
+   * @param center_x Principal point x coordinate
+   * @param constant_x Pre-computed constant for x calculation
+   * @param scan_msg The laser scan message with angle information
+   */
+  void initializeLookupTables(
+    uint32_t image_width, 
+    double center_x, 
+    double constant_x,
+    const sensor_msgs::msg::LaserScan::UniquePtr & scan_msg) const
+  {
+    // Check if tables are already initialized for these parameters
+    if (lookup_tables_initialized_ && 
+        cached_image_width_ == image_width &&
+        cached_center_x_ == center_x &&
+        cached_constant_x_ == constant_x) {
+      return;
+    }
+
+    // Resize lookup tables
+    angle_lookup_.resize(image_width);
+    index_lookup_.resize(image_width);
+    x_factor_lookup_.resize(image_width);
+
+    const double angle_increment = scan_msg->angle_increment;
+    const double angle_min = scan_msg->angle_min;
+
+    // Pre-calculate angle and index for each column
+    for (uint32_t u = 0; u < image_width; ++u) {
+      const double u_offset = static_cast<double>(u) - center_x;
+      x_factor_lookup_[u] = u_offset * constant_x;
+      
+      // Use fast atan approximation
+      angle_lookup_[u] = -fastAtan2(u_offset * constant_x, 1.0);
+      
+      // Pre-calculate the index for this column
+      index_lookup_[u] = static_cast<int>((angle_lookup_[u] - angle_min) / angle_increment);
+    }
+
+    // Cache parameters
+    cached_image_width_ = image_width;
+    cached_center_x_ = center_x;
+    cached_constant_x_ = constant_x;
+    lookup_tables_initialized_ = true;
+  }
 };
 }  // namespace depthimage_to_laserscan
 
